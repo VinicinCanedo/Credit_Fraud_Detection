@@ -1,4 +1,5 @@
 🛡️ Fraud Forensic Analytics Platform
+An end-to-end repository for forensic credit fraud detection and investigation using a Medallion data architecture.
 📌 Overview
 
 This project implements a forensic fraud detection analytics platform for a fictional financial institution (AuroraPay).
