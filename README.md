@@ -1,5 +1,7 @@
 # 🛡️ Fraud Forensic Analytics Platform
 
+<img width="1536" height="1024" alt="4b8956db-8f6b-4a50-8edb-6091262f8814" src="https://github.com/user-attachments/assets/21abc8e1-7f87-4188-82c6-d661e9bc2196" />
+
 ## 📌 Overview
 
 This project implements a **forensic fraud detection analytics platform** for a fictional financial institution (AuroraPay).
