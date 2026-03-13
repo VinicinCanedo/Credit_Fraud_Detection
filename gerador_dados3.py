@@ -12,6 +12,8 @@ import json
 NUM_RECORDS = 1000000  # 1 million records
 FRAUD_RATIO = 0.05
 SEED = 42
+CARD_TESTING_SHARE = 0.20
+LOST_STOLEN_SHARE = 0.35
 
 print(f"🔄 Starting Data Ingestion Simulation (Streaming Simulation)...")
 print("🎯 Objective: Exemplify First-party Fraud, Corporate Fraud and Traditional Fraud.")
@@ -63,6 +65,14 @@ fraud_type[idx_auto] = 'AUTOFRAUD'
 fraud_type[idx_corp] = 'CORPORATE'
 fraud_type[idx_tradi] = 'TRADITIONAL'
 
+# Traditional fraud subtypes are useful for downstream feature engineering
+n_card_testing = int(len(idx_tradi) * CARD_TESTING_SHARE)
+n_lost_stolen = int(len(idx_tradi) * LOST_STOLEN_SHARE)
+
+idx_tradi_card_testing = idx_tradi[:n_card_testing]
+idx_tradi_lost_stolen = idx_tradi[n_card_testing:n_card_testing + n_lost_stolen]
+idx_tradi_behavioral = idx_tradi[n_card_testing + n_lost_stolen:]
+
 # ==============================================================================
 # TOPIC 1: TRANSACTION_EVENTS
 # ==============================================================================
@@ -74,19 +84,88 @@ timestamps = pd.to_datetime(base_date + time_offsets.astype('timedelta64[s]'))
 df_trans = pd.DataFrame()
 df_trans['txn_id'] = txn_uuids
 df_trans['txn_timestamp'] = timestamps
-df_trans['txn_amount'] = np.random.lognormal(mean=3.5, sigma=1.0, size=NUM_RECORDS).round(2)
+# Customer-specific spending profile to avoid globally uniform behavior
+customer_avg_ticket = np.random.lognormal(mean=3.35, sigma=0.55, size=num_customers)
+customer_std_ticket = np.maximum(customer_avg_ticket * np.random.uniform(0.12, 0.55, num_customers), 1.0)
+sampled_amounts = np.random.normal(
+    loc=customer_avg_ticket[cust_indices],
+    scale=customer_std_ticket[cust_indices]
+)
+df_trans['txn_amount'] = np.round(np.clip(sampled_amounts, 1.20, 12000.0), 2)
 df_trans['txn_currency'] = 'BRL'
 df_trans['txn_type'] = np.random.choice(['CREDIT', 'DEBIT'], NUM_RECORDS, p=[0.7, 0.3])
 df_trans['txn_entry_mode'] = np.random.choice(['CHIP', 'CONTACTLESS', 'MAGSTRIPE', 'MANUAL'], NUM_RECORDS)
 df_trans['txn_status'] = 'APPROVED' # Default
 
-# Traditional Fraud Adjustment (Leak/Attack) -> Often status is Approved initially, or Denied
-df_trans.loc[idx_tradi, 'txn_amount'] = np.random.choice([1000.0, 4500.0, 9000.0], size=len(idx_tradi))
-df_trans.loc[idx_tradi, 'txn_entry_mode'] = 'MANUAL' # CNP (Card Not Present)
+# Traditional fraud adjustments
+# 1) Card testing: many low-value attempts and a subset of larger follow-up charges
+df_trans.loc[idx_tradi_card_testing, 'txn_amount'] = np.round(
+    np.random.uniform(1.10, 19.90, size=len(idx_tradi_card_testing)),
+    2
+)
+df_trans.loc[idx_tradi_card_testing, 'txn_type'] = 'DEBIT'
+df_trans.loc[idx_tradi_card_testing, 'txn_entry_mode'] = np.random.choice(
+    ['MANUAL', 'MAGSTRIPE'],
+    size=len(idx_tradi_card_testing),
+    p=[0.85, 0.15]
+)
+df_trans.loc[idx_tradi_card_testing, 'txn_status'] = np.random.choice(
+    ['APPROVED', 'DECLINED'],
+    size=len(idx_tradi_card_testing),
+    p=[0.80, 0.20]
+)
+
+n_big_after_test = max(1, int(len(idx_tradi_card_testing) * 0.14))
+idx_big_after_test = np.random.choice(idx_tradi_card_testing, size=n_big_after_test, replace=False)
+df_trans.loc[idx_big_after_test, 'txn_amount'] = np.round(
+    np.random.uniform(1200.0, 3800.0, size=n_big_after_test),
+    2
+)
+df_trans.loc[idx_big_after_test, 'txn_type'] = 'CREDIT'
+df_trans.loc[idx_big_after_test, 'txn_entry_mode'] = 'MANUAL'
+df_trans.loc[idx_big_after_test, 'txn_status'] = np.random.choice(
+    ['APPROVED', 'CHARGEBACK'],
+    size=n_big_after_test,
+    p=[0.65, 0.35]
+)
+
+# 2) Lost/stolen card: moderate-to-high spend burst, usually local and with chargeback later
+df_trans.loc[idx_tradi_lost_stolen, 'txn_amount'] = np.round(
+    np.random.lognormal(mean=5.2, sigma=0.65, size=len(idx_tradi_lost_stolen)),
+    2
+)
+df_trans.loc[idx_tradi_lost_stolen, 'txn_entry_mode'] = np.random.choice(
+    ['CHIP', 'CONTACTLESS', 'MAGSTRIPE', 'MANUAL'],
+    size=len(idx_tradi_lost_stolen),
+    p=[0.30, 0.35, 0.20, 0.15]
+)
+df_trans.loc[idx_tradi_lost_stolen, 'txn_status'] = np.random.choice(
+    ['APPROVED', 'CHARGEBACK'],
+    size=len(idx_tradi_lost_stolen),
+    p=[0.72, 0.28]
+)
+
+# 3) Behavioral/"too perfect" fraud: very rounded values and atypical consistency
+rounded_values = np.array([49.90, 79.90, 99.90, 199.90, 299.90, 499.90, 999.90])
+df_trans.loc[idx_tradi_behavioral, 'txn_amount'] = np.random.choice(
+    rounded_values,
+    size=len(idx_tradi_behavioral)
+)
+df_trans.loc[idx_tradi_behavioral, 'txn_type'] = 'CREDIT'
+df_trans.loc[idx_tradi_behavioral, 'txn_entry_mode'] = np.random.choice(
+    ['CONTACTLESS', 'MANUAL', 'CHIP'],
+    size=len(idx_tradi_behavioral),
+    p=[0.45, 0.40, 0.15]
+)
+df_trans.loc[idx_tradi_behavioral, 'txn_status'] = np.random.choice(
+    ['APPROVED', 'CHARGEBACK'],
+    size=len(idx_tradi_behavioral),
+    p=[0.78, 0.22]
+)
 
 # First-party Fraud Adjustment (Legitimate transaction that will be contested)
 # High value, made by the user themselves
-df_trans.loc[idx_auto, 'txn_amount'] = np.random.uniform(2000, 5000, size=len(idx_auto)).round(2)
+df_trans.loc[idx_auto, 'txn_amount'] = np.random.uniform(1500, 5200, size=len(idx_auto)).round(2)
 df_trans.loc[idx_auto, 'txn_status'] = np.random.choice(['APPROVED', 'CHARGEBACK'], len(idx_auto), p=[0.7, 0.3])
 # First-party fraud tends to be installments?
 df_trans.loc[idx_auto, 'installments_count'] = np.random.choice([10, 12], size=len(idx_auto))
@@ -135,12 +214,6 @@ br_states = [
     'PA', 'PB', 'PR', 'PE', 'PI', 'RJ', 'RN', 'RS', 'RO', 'RR', 'SC', 'SP', 'SE', 'TO'
 ]
 cust_default_region = np.random.choice(br_states, num_customers)
-
-# --- NEW: Customer Home Coordinates (Brazil Bounding Box approx) ---
-# Lat: -33 to 5, Long: -74 to -34
-df_cust['billing_latitude'] = np.random.uniform(-33.0, 5.0, num_customers)
-df_cust['billing_longitude'] = np.random.uniform(-74.0, -34.0, num_customers)
-
 # ==============================================================================
 # MERCHANT REGISTRY (JSON - Dict)
 # ==============================================================================
@@ -221,13 +294,13 @@ df_device['device_id'] = assigned_devices
 # 4. SCENARIO GENERATION (Region & Device Changes)
 
 # A. LEGITIMATE TRAVEL (Legit transactions in other BR states or Foreign)
-# 5% of legit transactions happen outside home region
+# 4% of legit transactions happen outside home region
 legit_indices = np.setdiff1d(np.arange(NUM_RECORDS), indices_fraud)
-n_travel = int(len(legit_indices) * 0.05)
+n_travel = int(len(legit_indices) * 0.04)
 idx_travel = np.random.choice(legit_indices, size=n_travel, replace=False)
 
-# Split travel: 80% Domestic, 20% International
-n_travel_int = int(n_travel * 0.2)
+# Split travel: mostly domestic, some international
+n_travel_int = int(n_travel * 0.05)
 idx_travel_int = idx_travel[:n_travel_int]
 idx_travel_dom = idx_travel[n_travel_int:]
 
@@ -235,12 +308,13 @@ assigned_regions[idx_travel_int] = np.random.choice(foreign_keys_list, size=len(
 assigned_regions[idx_travel_dom] = np.random.choice(states_keys_list, size=len(idx_travel_dom))
 
 # B. TRADITIONAL FRAUD (Attacker location)
-# New Device ID for Traditional Fraud
-new_devices = [str(uuid.uuid4()) for _ in range(len(idx_tradi))]
-df_device.loc[idx_tradi, 'device_id'] = new_devices
+# Only part of fraud uses a new device, to avoid trivial labeling rules
+idx_new_device = np.random.choice(idx_tradi, size=int(len(idx_tradi) * 0.55), replace=False)
+new_devices = [str(uuid.uuid4()) for _ in range(len(idx_new_device))]
+df_device.loc[idx_new_device, 'device_id'] = new_devices
 
-# Fraud Location: 60% Foreign Attack, 40% Domestic Attack (Different State)
-n_tradi_foreign = int(len(idx_tradi) * 0.60)
+# Fraud Location: mostly domestic; foreign fraud exists but is not dominant
+n_tradi_foreign = int(len(idx_tradi) * 0.08)
 idx_tradi_foreign = idx_tradi[:n_tradi_foreign]
 idx_tradi_domestic = idx_tradi[n_tradi_foreign:]
 
@@ -251,6 +325,43 @@ assigned_regions[idx_tradi_domestic] = np.random.choice(states_keys_list, size=l
 # Mostly home, but simulate some "travel" claims (20% foreign)
 idx_auto_location_change = np.random.choice(idx_auto, int(len(idx_auto)*0.2), replace=False)
 assigned_regions[idx_auto_location_change] = np.random.choice(foreign_keys_list, size=len(idx_auto_location_change))
+
+# D. CARD TESTING CLUSTERS (same IP across multiple cards)
+forced_ips = np.array([''] * NUM_RECORDS, dtype=object)
+forced_regions = np.array([''] * NUM_RECORDS, dtype=object)
+
+n_card_test_groups = max(20, int(len(idx_tradi_card_testing) / 180))
+card_test_groups = np.array_split(idx_tradi_card_testing, n_card_test_groups)
+
+for grp in card_test_groups:
+    if len(grp) == 0:
+        continue
+    attacker_ip = fake.ipv4_public()
+    attacker_region = np.random.choice(states_keys_list)
+    forced_ips[grp] = attacker_ip
+    forced_regions[grp] = attacker_region
+
+    # Force multiple cards being tested from the same source
+    if len(grp) > 3:
+        sampled_customers = np.random.choice(num_customers, size=len(grp), replace=True)
+        tested_cards = [card_ids_pool[i] for i in sampled_customers]
+        df_trans.loc[grp, 'card_id'] = tested_cards
+        df_trans.loc[grp, 'txn_type'] = 'DEBIT'
+
+    grp_big = np.intersect1d(grp, idx_big_after_test)
+    grp_small = np.setdiff1d(grp, grp_big)
+    if len(grp_small) > 0:
+        burst_start = pd.Timestamp.now() - pd.to_timedelta(np.random.randint(2, 85), unit='D')
+        small_offsets = np.sort(np.random.randint(0, 20 * 60, size=len(grp_small)))
+        df_trans.loc[grp_small, 'txn_timestamp'] = burst_start + pd.to_timedelta(small_offsets, unit='s')
+
+    if len(grp_big) > 0:
+        big_offsets = np.sort(np.random.randint(25 * 60, 3 * 3600, size=len(grp_big)))
+        reference_ts = pd.Timestamp.now() - pd.to_timedelta(np.random.randint(1, 70), unit='D')
+        df_trans.loc[grp_big, 'txn_timestamp'] = reference_ts + pd.to_timedelta(big_offsets, unit='s')
+
+mask_forced_region = forced_regions != ''
+assigned_regions[mask_forced_region] = forced_regions[mask_forced_region]
 
 # 5. GENERATE COORDINATES BASED ON REGION
 print("   - Calculating coordinates based on regions...")
@@ -294,7 +405,16 @@ final_longs = base_longs + np.random.uniform(-1.0, 1.0, NUM_RECORDS)
 df_device['device_latitude'] = final_lats
 df_device['device_longitude'] = final_longs
 
-df_device.loc[idx_tradi, 'device_model'] = 'Generic Emulator'
+# Fraud can include emulator traces, but not in all cases and not only in fraud
+idx_emulator_any = np.random.choice(np.arange(NUM_RECORDS), size=int(NUM_RECORDS * 0.015), replace=False)
+df_device.loc[idx_emulator_any, 'device_model'] = np.random.choice(
+    ['Android SDK built for x86', 'iPhone Simulator', 'BlueStacks'],
+    size=len(idx_emulator_any)
+)
+
+# Apply card-testing IP overrides after base generation
+mask_forced_ip = forced_ips != ''
+df_device.loc[mask_forced_ip, 'ip_address'] = forced_ips[mask_forced_ip]
 
 # Build mobile-style location payload in ip_region instead of using only region code
 location_accuracy = np.round(np.random.uniform(3.0, 60.0, NUM_RECORDS), 2)
@@ -325,7 +445,24 @@ location_payloads = [
     )
 ]
 
-df_device['ip_region'] = location_payloads
+# Mix region field formats to emulate heterogeneous telemetry sources
+region_format_type = np.random.choice(['json', 'state_city', 'code_only', 'legacy'], NUM_RECORDS, p=[0.45, 0.30, 0.20, 0.05])
+
+legacy_tags = ['EDGE-ROUTER', 'MOBILE-NAT', 'UNKNOWN', 'INTL-GW']
+city_samples = [fake.city() for _ in range(NUM_RECORDS)]
+
+mixed_ip_region = []
+for idx, fmt in enumerate(region_format_type):
+    if fmt == 'json':
+        mixed_ip_region.append(location_payloads[idx])
+    elif fmt == 'state_city':
+        mixed_ip_region.append(f"{assigned_regions[idx]}|{city_samples[idx]}")
+    elif fmt == 'code_only':
+        mixed_ip_region.append(str(assigned_regions[idx]))
+    else:
+        mixed_ip_region.append(f"{random.choice(legacy_tags)}:{assigned_regions[idx]}")
+
+df_device['ip_region'] = mixed_ip_region
 
 # Construct user-agent string from generated telemetry
 df_device['user_agent_string'] = [
@@ -348,10 +485,45 @@ df_auth = pd.DataFrame()
 df_auth['txn_id'] = txn_uuids
 df_auth['password_failures_session'] = 0
 df_auth['last_pin_change_days'] = np.random.randint(30, 800, NUM_RECORDS)
+df_auth['security_case_id'] = [str(uuid.uuid4()) for _ in range(NUM_RECORDS)]
+df_auth['card_reported_lost_stolen'] = False
+df_auth['loss_report_timestamp'] = None
+df_auth['loss_report_channel'] = None
 
-# Traditional: Brute force attack or stolen credential recently changed
-df_auth.loc[idx_tradi, 'password_failures_session'] = np.random.randint(3, 10, len(idx_tradi))
-df_auth.loc[idx_tradi, 'last_pin_change_days'] = np.random.randint(0, 2, len(idx_tradi))
+# Card testing and takeover: more password failures
+df_auth.loc[idx_tradi_card_testing, 'password_failures_session'] = np.random.randint(2, 8, len(idx_tradi_card_testing))
+df_auth.loc[idx_tradi_behavioral, 'password_failures_session'] = np.random.randint(1, 5, len(idx_tradi_behavioral))
+
+# Lost/stolen: generally no brute force, but recent PIN change is common in dispute timeline
+df_auth.loc[idx_tradi_lost_stolen, 'password_failures_session'] = np.random.randint(0, 3, len(idx_tradi_lost_stolen))
+df_auth.loc[idx_tradi_lost_stolen, 'last_pin_change_days'] = np.random.randint(0, 45, len(idx_tradi_lost_stolen))
+
+# Part of lost/stolen cases have formal report before transaction
+reported_lost_idx = np.random.choice(
+    idx_tradi_lost_stolen,
+    size=max(1, int(len(idx_tradi_lost_stolen) * 0.45)),
+    replace=False
+)
+
+txn_ts_dt = pd.to_datetime(df_trans['txn_timestamp'], errors='coerce')
+hours_before = pd.to_timedelta(np.random.randint(1, 96, size=len(reported_lost_idx)), unit='h')
+df_auth.loc[reported_lost_idx, 'card_reported_lost_stolen'] = True
+df_auth.loc[reported_lost_idx, 'loss_report_timestamp'] = (
+    txn_ts_dt.loc[reported_lost_idx] - hours_before
+).astype(str)
+df_auth.loc[reported_lost_idx, 'loss_report_channel'] = np.random.choice(
+    ['APP', 'CALL_CENTER', 'WHATSAPP', 'BRANCH'],
+    size=len(reported_lost_idx),
+    p=[0.45, 0.30, 0.20, 0.05]
+)
+
+# A tiny legitimate background of lost/stolen reports for realism
+legit_lost_idx = np.random.choice(legit_indices, size=max(1, int(len(legit_indices) * 0.0008)), replace=False)
+df_auth.loc[legit_lost_idx, 'card_reported_lost_stolen'] = True
+df_auth.loc[legit_lost_idx, 'loss_report_channel'] = np.random.choice(['APP', 'CALL_CENTER'], size=len(legit_lost_idx))
+df_auth.loc[legit_lost_idx, 'loss_report_timestamp'] = (
+    txn_ts_dt.loc[legit_lost_idx] - pd.to_timedelta(np.random.randint(1, 72, size=len(legit_lost_idx)), unit='h')
+).astype(str)
 
 df_auth['kafka_topic'] = 'security.logs'
 df_auth['ingestion_timestamp'] = df_trans['ingestion_timestamp']
@@ -421,10 +593,42 @@ df_merch.loc[city_idx, 'merchant_city'] = df_merch.loc[city_idx, 'merchant_city'
 print("💥 Injecting Data Quality Issues (Naming, Formats, Ambiguity)...")
 
 # 1. Naming Conventions (Inconsistent Column Names)
-df_cust = df_cust.rename(columns={'card_id': 'card_number'})
-df_merch = df_merch.rename(columns={'merchant_id': 'merch_code'})
-df_device = df_device.rename(columns={'txn_id': 'transaction_ref'})
-df_auth = df_auth.rename(columns={'txn_id': 'trans_id'})
+df_trans = df_trans.rename(columns={
+    'txn_id': 'transaction_ID',
+    'merchant_id': 'MERCHANT_ID',
+    'card_id': 'cardId'
+})
+
+df_cust = df_cust.rename(columns={
+    'card_id': 'CardNumber',
+    'customer_id': 'customer_id',
+    'account_id': 'AccountRef'
+})
+df_merch = df_merch.rename(columns={
+    'merchant_id': 'MERCHANT_ID',
+    'merchant_name': 'merchantName',
+    'mcc_code': 'MCC'
+})
+df_device = df_device.rename(columns={
+    'txn_id': 'transaction_ID',
+    'device_id': 'DeviceID',
+    'ip_address': 'IP_ADDRESS'
+})
+df_auth['SecurityLogsId'] = [str(uuid.uuid4()) for _ in range(len(df_auth))]
+df_auth = df_auth.rename(columns={'txn_id': 'transaction_ID'})
+
+# Inconsistent key formatting between systems
+trans_key_mess_idx = np.random.choice(df_trans.index, size=int(len(df_trans) * 0.07), replace=False)
+df_trans.loc[trans_key_mess_idx, 'transaction_ID'] = df_trans.loc[trans_key_mess_idx, 'transaction_ID'].str.replace('-', '').str.upper()
+
+device_key_mess_idx = np.random.choice(df_device.index, size=int(len(df_device) * 0.09), replace=False)
+df_device.loc[device_key_mess_idx, 'transaction_ID'] = df_device.loc[device_key_mess_idx, 'transaction_ID'].str.lower()
+
+merch_key_mess_idx = np.random.choice(df_merch.index, size=int(len(df_merch) * 0.08), replace=False)
+df_merch.loc[merch_key_mess_idx, 'MERCHANT_ID'] = '{' + df_merch.loc[merch_key_mess_idx, 'MERCHANT_ID'] + '}'
+
+security_key_mess_idx = np.random.choice(df_auth.index, size=int(len(df_auth) * 0.08), replace=False)
+df_auth.loc[security_key_mess_idx, 'transaction_ID'] = df_auth.loc[security_key_mess_idx, 'transaction_ID'].str.replace('-', '')
 
 # 2. Data Formats (Typos, Mixed Languages)
 # Mix languages in 'txn_type' (Credit vs Crédito)
@@ -437,6 +641,23 @@ mask_typo = np.random.rand(len(df_trans)) < 0.1
 df_trans.loc[mask_typo, 'txn_status'] = 'approved' # lowercase
 mask_typo2 = np.random.rand(len(df_trans)) < 0.05
 df_trans.loc[mask_typo2, 'txn_status'] = 'Aprovado' # Portuguese
+
+# Mixed date formats in ingestion fields
+trans_ts_mess_idx = np.random.choice(df_trans.index, size=int(len(df_trans) * 0.03), replace=False)
+df_trans.loc[trans_ts_mess_idx, 'ingestion_timestamp'] = pd.to_datetime(
+    df_trans.loc[trans_ts_mess_idx, 'ingestion_timestamp'],
+    errors='coerce'
+).dt.strftime('%d/%m/%Y %H:%M:%S')
+
+device_ts_mess_idx = np.random.choice(df_device.index, size=int(len(df_device) * 0.03), replace=False)
+df_device.loc[device_ts_mess_idx, 'ingestion_timestamp'] = pd.to_datetime(
+    df_device.loc[device_ts_mess_idx, 'ingestion_timestamp'],
+    errors='coerce'
+).dt.strftime('%Y/%m/%d %H:%M:%S')
+
+# Noisy ZIP/postal code formats
+zip_mess_idx = np.random.choice(df_cust.index, size=int(len(df_cust) * 0.12), replace=False)
+df_cust.loc[zip_mess_idx, 'customer_zip_code'] = df_cust.loc[zip_mess_idx, 'customer_zip_code'].astype(str).str.replace('-', '').str.zfill(8)
 
 # Weird characters in strings (Merchant City)
 def mess_string(s):
