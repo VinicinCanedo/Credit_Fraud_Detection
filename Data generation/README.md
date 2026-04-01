@@ -109,3 +109,12 @@ git push origin main
 
 No workspace atual, o remote esta configurado para outro repositorio (`PagSeguro`).
 Se quiser enviar diretamente para `Credit_Fraud_Detection`, ajuste o remote ou trabalhe em um clone desse repositorio.
+
+## Fluxo recomendado com Pull Request
+
+Para novas alteracoes, prefira este fluxo:
+
+1. Crie branch de feature a partir da main.
+2. Faça commits pequenos e descritivos.
+3. Abra PR para main com resumo tecnico e checklist de testes.
+4. Faça merge somente apos validacao.
