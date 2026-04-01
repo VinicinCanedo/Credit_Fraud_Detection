@@ -4,9 +4,10 @@ from faker import Faker
 import random
 import uuid
 from datetime import datetime, timedelta
-import fastavro
-import os
 import json
+
+from modules.data_utils import inject_nulls, inject_duplicates, mess_string, save_avro, save_json
+from modules.merchant_registry import generate_merchant_registry
 
 # --- CONFIGURATION ---
 NUM_RECORDS = 1000000  # 1 million records
@@ -93,7 +94,8 @@ sampled_amounts = np.random.normal(
 )
 df_trans['txn_amount'] = np.round(np.clip(sampled_amounts, 1.20, 12000.0), 2)
 df_trans['txn_currency'] = 'BRL'
-df_trans['txn_type'] = np.random.choice(['CREDIT', 'DEBIT'], NUM_RECORDS, p=[0.7, 0.3])
+# Internal-only transaction type used to build pos_entry_details later
+df_trans['_txn_type_internal'] = np.random.choice(['CREDIT', 'DEBIT'], NUM_RECORDS, p=[0.7, 0.3])
 df_trans['txn_entry_mode'] = np.random.choice(['CHIP', 'CONTACTLESS', 'MAGSTRIPE', 'MANUAL'], NUM_RECORDS)
 df_trans['txn_status'] = 'APPROVED' # Default
 
@@ -103,7 +105,7 @@ df_trans.loc[idx_tradi_card_testing, 'txn_amount'] = np.round(
     np.random.uniform(1.10, 19.90, size=len(idx_tradi_card_testing)),
     2
 )
-df_trans.loc[idx_tradi_card_testing, 'txn_type'] = 'DEBIT'
+df_trans.loc[idx_tradi_card_testing, '_txn_type_internal'] = 'DEBIT'
 df_trans.loc[idx_tradi_card_testing, 'txn_entry_mode'] = np.random.choice(
     ['MANUAL', 'MAGSTRIPE'],
     size=len(idx_tradi_card_testing),
@@ -121,7 +123,7 @@ df_trans.loc[idx_big_after_test, 'txn_amount'] = np.round(
     np.random.uniform(1200.0, 3800.0, size=n_big_after_test),
     2
 )
-df_trans.loc[idx_big_after_test, 'txn_type'] = 'CREDIT'
+df_trans.loc[idx_big_after_test, '_txn_type_internal'] = 'CREDIT'
 df_trans.loc[idx_big_after_test, 'txn_entry_mode'] = 'MANUAL'
 df_trans.loc[idx_big_after_test, 'txn_status'] = np.random.choice(
     ['APPROVED', 'CHARGEBACK'],
@@ -151,7 +153,7 @@ df_trans.loc[idx_tradi_behavioral, 'txn_amount'] = np.random.choice(
     rounded_values,
     size=len(idx_tradi_behavioral)
 )
-df_trans.loc[idx_tradi_behavioral, 'txn_type'] = 'CREDIT'
+df_trans.loc[idx_tradi_behavioral, '_txn_type_internal'] = 'CREDIT'
 df_trans.loc[idx_tradi_behavioral, 'txn_entry_mode'] = np.random.choice(
     ['CONTACTLESS', 'MANUAL', 'CHIP'],
     size=len(idx_tradi_behavioral),
@@ -174,7 +176,7 @@ df_trans.loc[idx_auto, 'installments_count'] = np.random.choice([10, 12], size=l
 # Round values, credit transfer
 df_trans.loc[idx_corp, 'txn_amount'] = np.random.choice([1000.0, 2000.0, 3000.0, 5000.0, 10000.0], size=len(idx_corp))
 df_trans.loc[idx_corp, 'installments_count'] = 1
-df_trans.loc[idx_corp, 'txn_type'] = 'CREDIT'
+df_trans.loc[idx_corp, '_txn_type_internal'] = 'CREDIT'
 
 # Foreign Keys
 df_trans['card_id'] = [card_ids_pool[i] for i in cust_indices]
@@ -202,9 +204,68 @@ df_cust = pd.DataFrame()
 df_cust['card_id'] = card_ids_pool
 df_cust['account_id'] = account_ids_pool
 df_cust['customer_id'] = [str(uuid.uuid4()) for _ in range(num_customers)]
-df_cust['card_bin'] = np.random.choice(['454545', '550100', '491600'], num_customers)
-df_cust['card_type'] = np.random.choice(['Gold', 'Platinum', 'Black'], num_customers)
 df_cust['customer_zip_code'] = [fake.postcode() for _ in range(num_customers)]
+
+# Card details payload
+card_brands = np.random.choice(['Visa', 'Mastercard', 'Elo'], num_customers, p=[0.45, 0.40, 0.15])
+card_categories = np.random.choice(['Gold', 'Platinum', 'Black'], num_customers, p=[0.45, 0.35, 0.20])
+card_types = np.random.choice(['Débito', 'Crédito'], num_customers, p=[0.35, 0.65])
+is_virtual_cards = np.random.choice([True, False], num_customers, p=[0.28, 0.72])
+card_security_codes = [f"{np.random.randint(0, 1000):03d}" for _ in range(num_customers)]
+
+issue_dates = [
+    datetime.now() - timedelta(days=int(np.random.randint(120, 3650)))
+    for _ in range(num_customers)
+]
+expiration_dates = [
+    issue_date + timedelta(days=int(np.random.randint(3 * 365, 6 * 365)))
+    for issue_date in issue_dates
+]
+
+card_limits = np.round(np.random.uniform(1200.0, 45000.0, num_customers), 2)
+available_factors = np.random.uniform(0.08, 0.95, num_customers)
+available_limits = np.round(card_limits * available_factors, 2)
+
+df_cust['card_details'] = [
+    json.dumps(
+        {
+            'card_brand': brand,
+            'card_category': category,
+            'card_type': ctype,
+            'is_card_virtual': bool(is_virtual),
+            'security_code': sec_code,
+            'issue_date': issue_date.strftime('%Y-%m-%d'),
+            'expiration_date': exp_date.strftime('%Y-%m-%d'),
+            'card_limit': float(limit),
+            'available_limit': float(avail_limit)
+        },
+        ensure_ascii=True
+    )
+    for brand, category, ctype, is_virtual, sec_code, issue_date, exp_date, limit, avail_limit in zip(
+        card_brands,
+        card_categories,
+        card_types,
+        is_virtual_cards,
+        card_security_codes,
+        issue_dates,
+        expiration_dates,
+        card_limits,
+        available_limits
+    )
+]
+
+customer_genders = np.random.choice(['F', 'M', 'Nao informado'], num_customers, p=[0.49, 0.49, 0.02])
+customer_ages = np.random.randint(18, 89, num_customers)
+df_cust['client_details'] = [
+    json.dumps(
+        {
+            'customer_gender': gender,
+            'customer_age': int(age)
+        },
+        ensure_ascii=True
+    )
+    for gender, age in zip(customer_genders, customer_ages)
+]
 # Customer -> Default Device Mapping
 cust_default_device = [str(uuid.uuid4()) for _ in range(num_customers)]
 
@@ -218,15 +279,7 @@ cust_default_region = np.random.choice(br_states, num_customers)
 # MERCHANT REGISTRY (JSON - Dict)
 # ==============================================================================
 print("📡 Generating merchant.registry...")
-df_merch = pd.DataFrame()
-df_merch['merchant_id'] = merchant_ids_pool
-df_merch['merchant_name'] = [fake.company() for _ in range(num_merchants)]
-df_merch['mcc_code'] = np.random.choice(['5411', '5812', '5541', '5732', '7995', '5999'], num_merchants)
-df_merch['merchant_city'] = [fake.city() for _ in range(num_merchants)]
-
-# --- NEW: Merchant Coordinates ---
-df_merch['merchant_latitude'] = np.random.uniform(-33.0, 5.0, num_merchants)
-df_merch['merchant_longitude'] = np.random.uniform(-74.0, -34.0, num_merchants)
+df_merch = generate_merchant_registry(merchant_ids_pool, num_merchants, fake)
 
 # ==============================================================================
 # DEVICE SIGNALS
@@ -346,19 +399,21 @@ for grp in card_test_groups:
         sampled_customers = np.random.choice(num_customers, size=len(grp), replace=True)
         tested_cards = [card_ids_pool[i] for i in sampled_customers]
         df_trans.loc[grp, 'card_id'] = tested_cards
-        df_trans.loc[grp, 'txn_type'] = 'DEBIT'
+        df_trans.loc[grp, '_txn_type_internal'] = 'DEBIT'
 
     grp_big = np.intersect1d(grp, idx_big_after_test)
     grp_small = np.setdiff1d(grp, grp_big)
     if len(grp_small) > 0:
         burst_start = pd.Timestamp.now() - pd.to_timedelta(np.random.randint(2, 85), unit='D')
         small_offsets = np.sort(np.random.randint(0, 20 * 60, size=len(grp_small)))
-        df_trans.loc[grp_small, 'txn_timestamp'] = burst_start + pd.to_timedelta(small_offsets, unit='s')
+        burst_ts = burst_start + pd.to_timedelta(small_offsets, unit='s')
+        df_trans.loc[grp_small, 'txn_timestamp'] = pd.Series(burst_ts).dt.strftime('%Y-%m-%d %H:%M:%S').to_numpy()
 
     if len(grp_big) > 0:
         big_offsets = np.sort(np.random.randint(25 * 60, 3 * 3600, size=len(grp_big)))
         reference_ts = pd.Timestamp.now() - pd.to_timedelta(np.random.randint(1, 70), unit='D')
-        df_trans.loc[grp_big, 'txn_timestamp'] = reference_ts + pd.to_timedelta(big_offsets, unit='s')
+        big_ts = reference_ts + pd.to_timedelta(big_offsets, unit='s')
+        df_trans.loc[grp_big, 'txn_timestamp'] = pd.Series(big_ts).dt.strftime('%Y-%m-%d %H:%M:%S').to_numpy()
 
 mask_forced_region = forced_regions != ''
 assigned_regions[mask_forced_region] = forced_regions[mask_forced_region]
@@ -402,9 +457,6 @@ base_longs = pd.Series(assigned_regions).map(lon_map).fillna(-46.6).values
 final_lats = base_lats + np.random.uniform(-1.0, 1.0, NUM_RECORDS)
 final_longs = base_longs + np.random.uniform(-1.0, 1.0, NUM_RECORDS)
 
-df_device['device_latitude'] = final_lats
-df_device['device_longitude'] = final_longs
-
 # Fraud can include emulator traces, but not in all cases and not only in fraud
 idx_emulator_any = np.random.choice(np.arange(NUM_RECORDS), size=int(NUM_RECORDS * 0.015), replace=False)
 df_device.loc[idx_emulator_any, 'device_model'] = np.random.choice(
@@ -444,25 +496,7 @@ location_payloads = [
         assigned_regions
     )
 ]
-
-# Mix region field formats to emulate heterogeneous telemetry sources
-region_format_type = np.random.choice(['json', 'state_city', 'code_only', 'legacy'], NUM_RECORDS, p=[0.45, 0.30, 0.20, 0.05])
-
-legacy_tags = ['EDGE-ROUTER', 'MOBILE-NAT', 'UNKNOWN', 'INTL-GW']
-city_samples = [fake.city() for _ in range(NUM_RECORDS)]
-
-mixed_ip_region = []
-for idx, fmt in enumerate(region_format_type):
-    if fmt == 'json':
-        mixed_ip_region.append(location_payloads[idx])
-    elif fmt == 'state_city':
-        mixed_ip_region.append(f"{assigned_regions[idx]}|{city_samples[idx]}")
-    elif fmt == 'code_only':
-        mixed_ip_region.append(str(assigned_regions[idx]))
-    else:
-        mixed_ip_region.append(f"{random.choice(legacy_tags)}:{assigned_regions[idx]}")
-
-df_device['ip_region'] = mixed_ip_region
+df_device['ip_region'] = location_payloads
 
 # Construct user-agent string from generated telemetry
 df_device['user_agent_string'] = [
@@ -470,9 +504,6 @@ df_device['user_agent_string'] = [
     f"AppleWebKit/537.36 (KHTML, like Gecko) {browser.replace(' Mobile', '')}/120.0 Mobile AuroraPay/{app_ver}"
     for os_name, browser, app_ver in zip(df_device['device_os'], df_device['device_browser'], df_device['app_version'])
 ]
-
-# Keep region code explicit for easier filtering/analytics
-df_device['ip_region_code'] = assigned_regions
 
 df_device['kafka_topic'] = 'device.signals'
 df_device['ingestion_timestamp'] = df_trans['ingestion_timestamp']
@@ -533,27 +564,6 @@ df_auth['ingestion_timestamp'] = df_trans['ingestion_timestamp']
 # ==============================================================================
 print("🌪️ Injecting Data Quality Issues (Dirt)...")
 
-def inject_nulls(df, columns, ratio=0.05):
-    """Sets a portion of values in specified columns to None/NaN"""
-    n_rows = len(df)
-    n_nulls = int(n_rows * ratio)
-    for col in columns:
-        if col in df.columns:
-            # Avoid overwriting existing NaNs if possible, but simple choice is fine
-            # We must use iloc or loc carefully. converting to object if needed for None
-            df[col] = df[col].astype(object)
-            indices = np.random.choice(df.index, n_nulls, replace=False) 
-            df.loc[indices, col] = None
-    return df
-
-def inject_duplicates(df, ratio=0.02):
-    """Duplicates a random portion of rows"""
-    n_rows = len(df)
-    n_dupes = int(n_rows * ratio)
-    indices = np.random.choice(df.index, n_dupes, replace=False)
-    duplicates = df.loc[indices].copy()
-    return pd.concat([df, duplicates], ignore_index=True)
-
 # 1. Duplicates
 print("   - Creating duplicates in Transactions and Customers...")
 df_trans = inject_duplicates(df_trans, ratio=0.03) # 3% duplicates
@@ -562,7 +572,7 @@ df_cust = inject_duplicates(df_cust, ratio=0.01)   # 1% duplicates
 # 2. Missing Values (Nulls)
 print("   - Inserting Nulls/NaNs...")
 df_trans = inject_nulls(df_trans, ['txn_entry_mode', 'merchant_id'], ratio=0.08)
-df_cust = inject_nulls(df_cust, ['customer_zip_code', 'card_type'], ratio=0.10)
+df_cust = inject_nulls(df_cust, ['customer_zip_code', 'card_details'], ratio=0.10)
 df_merch = inject_nulls(df_merch, ['merchant_city', 'mcc_code'], ratio=0.05)
 
 # 3. Inconsistencies & Errors
@@ -631,10 +641,10 @@ security_key_mess_idx = np.random.choice(df_auth.index, size=int(len(df_auth) * 
 df_auth.loc[security_key_mess_idx, 'transaction_ID'] = df_auth.loc[security_key_mess_idx, 'transaction_ID'].str.replace('-', '')
 
 # 2. Data Formats (Typos, Mixed Languages)
-# Mix languages in 'txn_type' (Credit vs Crédito)
-df_trans['txn_type'] = df_trans['txn_type'].astype(object)
+# Mix languages in internal txn type (Credit vs Crédito)
+df_trans['_txn_type_internal'] = df_trans['_txn_type_internal'].astype(object)
 mask_pt = np.random.rand(len(df_trans)) < 0.3
-df_trans.loc[mask_pt, 'txn_type'] = df_trans.loc[mask_pt, 'txn_type'].replace({'CREDIT': 'Crédito', 'DEBIT': 'Débito'})
+df_trans.loc[mask_pt, '_txn_type_internal'] = df_trans.loc[mask_pt, '_txn_type_internal'].replace({'CREDIT': 'Crédito', 'DEBIT': 'Débito'})
 
 # Typos/Case mismatch in 'txn_status'
 mask_typo = np.random.rand(len(df_trans)) < 0.1
@@ -660,93 +670,27 @@ zip_mess_idx = np.random.choice(df_cust.index, size=int(len(df_cust) * 0.12), re
 df_cust.loc[zip_mess_idx, 'customer_zip_code'] = df_cust.loc[zip_mess_idx, 'customer_zip_code'].astype(str).str.replace('-', '').str.zfill(8)
 
 # Weird characters in strings (Merchant City)
-def mess_string(s):
-    if pd.isna(s): return s
-    if random.random() < 0.1:
-        return str(s).replace('a', '@').replace('e', '3').replace('i', '1')
-    return s
-
 df_merch['merchant_city'] = df_merch['merchant_city'].apply(mess_string)
 
 # 3. Ambiguous Attributes (Concatenated fields)
-# customer_profiles: Combine 'card_type', 'card_bin' -> 'client_details'
-df_cust['client_details'] = df_cust.apply(
-    lambda row: f"Type:{row['card_type']}|BIN:{row['card_bin']}", axis=1
-)
-df_cust.drop(columns=['card_type', 'card_bin'], inplace=True)
-
 # transaction_events: Combine 'txn_entry_mode' -> 'pos_entry_details'
 df_trans['pos_entry_details'] = df_trans.apply(
-    lambda row: json.dumps({'mode': row['txn_entry_mode'], 'type': row['txn_type']}), axis=1
+    lambda row: json.dumps({'mode': row['txn_entry_mode'], 'type': row['_txn_type_internal']}), axis=1
 )
-df_trans.drop(columns=['txn_entry_mode'], inplace=True)
+df_trans.drop(columns=['txn_entry_mode', '_txn_type_internal'], inplace=True)
 
 # ==============================================================================
 # EXPORT
 # ==============================================================================
 base_path = "aurorapay_transactions/"
-os.makedirs(base_path, exist_ok=True)
-
-def save_avro(df, folder_name):
-    print(f"   💾 Attempting to save Avro: {folder_name}...")
-    try:
-        # Convert NaN to None for compatible Avro writing
-        # Using replace is safer than where for mixed types
-        df_export = df.replace({np.nan: None})
-        
-        records = df_export.to_dict('records')
-        
-        schema = {
-            "type": "record",
-            "name": folder_name,
-            "fields": []
-        }
-        
-        for col, dtype in df.dtypes.items():
-            # Fallback to string for complex types
-            avro_type = ["null", "string"] # Default nullable string
-            if pd.api.types.is_integer_dtype(dtype):
-                avro_type = ["null", "long"]
-            elif pd.api.types.is_float_dtype(dtype):
-                 # Ensure we handle the case where integers became floats due to NaNs
-                avro_type = ["null", "double"]
-            elif pd.api.types.is_bool_dtype(dtype):
-                 avro_type = ["null", "boolean"]
-                 
-            schema["fields"].append({"name": col, "type": avro_type})
-
-        out_dir = f"{base_path}/{folder_name}"
-        os.makedirs(out_dir, exist_ok=True)
-
-        # Unique file name with timestamp
-        timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-        out_file = f"{out_dir}/data_{timestamp}.avro"
-        
-        with open(out_file, 'wb') as f:
-            fastavro.writer(f, schema, records)
-        print(f"      ✅ Success: {out_file}")
-
-    except Exception as e:
-        print(f"      ❌ ERROR saving {folder_name}: {e}")
-        print("      ⚠️ Skipping this file and continuing...")
-
-def save_json(df, folder_name):
-    out_dir = f"{base_path}/{folder_name}"
-    os.makedirs(out_dir, exist_ok=True)
-    
-    timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-    out_file = f"{out_dir}/data_{timestamp}.json"
-    
-    print(f"   💾 Saving JSON: {out_file}")
-    df.to_json(out_file, orient='records', lines=True) # Line-delimited JSON usually best for big data
 
 # 1. JSON Exports
-save_json(df_cust, "customer_profiles")
-save_json(df_merch, "merchant_registry")
+save_json(df_cust, "customer_profiles", base_path)
+save_json(df_merch, "merchant_registry", base_path)
 
 # 2. Avro Exports
-save_avro(df_trans, "transaction_events")
-save_avro(df_device, "device_signals")
-save_avro(df_auth, "security_logs")
+save_avro(df_trans, "transaction_events", base_path)
+save_avro(df_device, "device_signals", base_path)
+save_avro(df_auth, "security_logs", base_path)
 
 print("\n✅ Generation concluded!")
