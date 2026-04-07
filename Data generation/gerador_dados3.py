@@ -289,23 +289,45 @@ df_device = pd.DataFrame()
 df_device['txn_id'] = txn_uuids
 df_device['ip_address'] = [fake.ipv4() for _ in range(NUM_RECORDS)]
 
-# Device telemetry fields commonly collected by mobile apps
-device_os_choices = np.random.choice(['Android', 'iOS'], NUM_RECORDS, p=[0.65, 0.35])
+# Device telemetry is kept only inside user_agent_string (JSON payload)
+device_form_factor = np.random.choice(['MOBILE', 'DESKTOP'], NUM_RECORDS, p=[0.83, 0.17])
+mobile_os_choices = np.random.choice(['Android', 'iOS'], NUM_RECORDS, p=[0.65, 0.35])
+desktop_os_choices = np.random.choice(['Windows', 'macOS', 'Linux'], NUM_RECORDS, p=[0.62, 0.28, 0.10])
+device_os_choices = np.where(device_form_factor == 'MOBILE', mobile_os_choices, desktop_os_choices)
+
 android_models = np.array(['Samsung Galaxy S23', 'Samsung Galaxy A54', 'Xiaomi 13', 'Motorola Edge 40'])
 ios_models = np.array(['iPhone 13', 'iPhone 14', 'iPhone 15', 'iPhone SE'])
+notebook_models = np.array(['Dell XPS 13', 'ThinkPad T14', 'HP Pavilion 14', 'Acer Aspire 5'])
+laptop_models = np.array(['MacBook Air M2', 'Lenovo IdeaPad 3', 'ASUS VivoBook 15', 'Samsung Book'])
 
-df_device['device_os'] = device_os_choices
-df_device['device_model'] = np.where(
-    device_os_choices == 'Android',
-    np.random.choice(android_models, NUM_RECORDS),
-    np.random.choice(ios_models, NUM_RECORDS)
+device_model_choices = np.where(
+    device_form_factor == 'MOBILE',
+    np.where(
+        mobile_os_choices == 'Android',
+        np.random.choice(android_models, NUM_RECORDS),
+        np.random.choice(ios_models, NUM_RECORDS)
+    ),
+    np.where(
+        device_form_factor == 'NOTEBOOK',
+        np.random.choice(notebook_models, NUM_RECORDS),
+        np.random.choice(laptop_models, NUM_RECORDS)
+    )
 )
-df_device['device_browser'] = np.random.choice(['Chrome Mobile', 'Safari Mobile', 'Firefox Mobile', 'Edge Mobile'], NUM_RECORDS)
-df_device['device_language'] = np.random.choice(['pt-BR', 'en-US', 'es-ES'], NUM_RECORDS, p=[0.85, 0.10, 0.05])
-df_device['app_version'] = np.where(
-    device_os_choices == 'Android',
-    np.random.choice(['6.1.0', '6.1.1', '6.2.0', '6.2.1'], NUM_RECORDS),
-    np.random.choice(['5.9.0', '5.9.1', '6.0.0', '6.0.1'], NUM_RECORDS)
+
+device_language_choices = np.random.choice(['pt-BR', 'en-US', 'es-ES'], NUM_RECORDS, p=[0.85, 0.10, 0.05])
+device_browser_choices = np.where(
+    device_form_factor == 'MOBILE',
+    None,
+    np.random.choice(['Chrome', 'Safari', 'Firefox', 'Edge'], NUM_RECORDS)
+)
+app_version_choices = np.where(
+    device_form_factor == 'MOBILE',
+    np.where(
+        mobile_os_choices == 'Android',
+        np.random.choice(['6.1.0', '6.1.1', '6.2.0', '6.2.1'], NUM_RECORDS),
+        np.random.choice(['5.9.0', '5.9.1', '6.0.0', '6.0.1'], NUM_RECORDS)
+    ),
+    None
 )
 
 # --- Geo-Coordinates & Region Logic ---
@@ -459,7 +481,7 @@ final_longs = base_longs + np.random.uniform(-1.0, 1.0, NUM_RECORDS)
 
 # Fraud can include emulator traces, but not in all cases and not only in fraud
 idx_emulator_any = np.random.choice(np.arange(NUM_RECORDS), size=int(NUM_RECORDS * 0.015), replace=False)
-df_device.loc[idx_emulator_any, 'device_model'] = np.random.choice(
+device_model_choices[idx_emulator_any] = np.random.choice(
     ['Android SDK built for x86', 'iPhone Simulator', 'BlueStacks'],
     size=len(idx_emulator_any)
 )
@@ -498,11 +520,27 @@ location_payloads = [
 ]
 df_device['ip_region'] = location_payloads
 
-# Construct user-agent string from generated telemetry
+# Construct device/app payload; browser is only present for notebook/laptop
 df_device['user_agent_string'] = [
-    f"Mozilla/5.0 ({'Linux; Android 13' if os_name == 'Android' else 'iPhone; CPU iPhone OS 17_0 like Mac OS X'}) "
-    f"AppleWebKit/537.36 (KHTML, like Gecko) {browser.replace(' Mobile', '')}/120.0 Mobile AuroraPay/{app_ver}"
-    for os_name, browser, app_ver in zip(df_device['device_os'], df_device['device_browser'], df_device['app_version'])
+    json.dumps(
+        {
+            'device_form_factor': str(form_factor),
+            'device_os': str(os_name),
+            'device_model': str(model),
+            'device_browser': (str(browser) if browser is not None else None),
+            'device_language': str(lang),
+            'app_version': (str(app_ver) if app_ver is not None else None)
+        },
+        ensure_ascii=True
+    )
+    for form_factor, os_name, model, browser, lang, app_ver in zip(
+        device_form_factor,
+        device_os_choices,
+        device_model_choices,
+        device_browser_choices,
+        device_language_choices,
+        app_version_choices
+    )
 ]
 
 df_device['kafka_topic'] = 'device.signals'
